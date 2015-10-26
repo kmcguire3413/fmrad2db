@@ -2,13 +2,15 @@ extern crate byteorder;
 
 mod sha1;
 
+use std::mem;
 use std::sync::mpsc::{Sender, Receiver, channel};
 use super::{TcpSocket, TcpSocketMessage, Net, SuperVec, NetOp, TcpSocketReadError};
 
 pub enum Field {
     i64(i64),
-    Text(Vec<u8>),
-};
+    String(String),
+    Unknown,
+}
 
 // This is the field as the server names it.
 pub enum ServerFieldType {
@@ -16,13 +18,13 @@ pub enum ServerFieldType {
     LongLong,
     String,
     VarString,
-};
+}
 
 // This is the field as the this system names it.
 pub enum FieldType {
     Integer,
     String,
-};
+}
 
 pub enum FieldHeader {
     Normal {
@@ -35,21 +37,21 @@ pub enum FieldHeader {
         charset:        u16,
         len:            u32,
         stype:          ServerFieldType,
-        type:           FieldType,
-        flags:          u8,
+        itype:          FieldType,
+        flags:          u16,
         decimals:       u8,
     },
     Empty,                    
-};
+}
 
 pub struct Record {
     fields:     Vec<Field>,
-};
+}
 
 pub enum Response {
     Error,
     Table { records: Vec<Record> },
-};
+}
 
 pub struct MySQLConnection {
     user:               Vec<u8>,
@@ -59,13 +61,13 @@ pub struct MySQLConnection {
     conn_ready:         bool,
     socket:             TcpSocket,
     net_tx:             Sender<NetOp>,
-    pending_statements: Vec<MySQLPendingStatement>,
     buffer:             Vec<u8>,
     responses:          Vec<Response>,
     // These affect the state of the construct in packet interpretation.
     pending_response:   u32,
     number_of_fields:   u8,
-    field_headers:      Vec<FieldHeaderType>,
+    field_headers:      Vec<FieldHeader>,
+    pending_records:    Vec<Record>,
 }
 
 pub enum SocketReadError {
@@ -73,12 +75,14 @@ pub enum SocketReadError {
 }
 
 impl MySQLConnection {
-    /*
-        Return a new MySQL connection represented with this object.
-
-        (1) Not required to actually establish connection.
-        (2) Required to be able to establish connection when needed.
-    */
+    ///  Return a new MySQL connection represented with this object. The connection will
+    ///  not be attempted until `tick` is called.
+    ///
+    ///  # Contract
+    ///    * connection shall not be attempted until `tick` is called
+    ///    * connection shall be re-established if and only if lost
+    ///    * connection is not guaranteed to succeed
+    ///    * query strings not executed shall be pending until connection is established
     pub fn new_with_ipv4_tcp(net: &Net, remote_ip: u32, remote_port: u16, user: Vec<u8>, pass: Vec<u8>) -> MySQLConnection {
         MySQLConnection {
             buffer:              Vec::new(),
@@ -93,18 +97,8 @@ impl MySQLConnection {
             responses:           Vec::new(),
             number_of_fields:    0,
             field_headers:       Vec::new(),
+            pending_records:     Vec::new(),
         }
-    }
-
-    pub fn u8readuntil(s: &[u8], u: u8) -> Vec<u8> {
-        let mut b: Vec<u8> = Vec::new();
-        for x in 0..s.len() {
-            if s[x] == u {
-                break;
-            }
-            b.push(s[x]);
-        }
-        b
     }
     
     /*
@@ -127,30 +121,64 @@ impl MySQLConnection {
     }
     
     fn send_cmd_use_database(&mut self, schema: &[u8]) {
-        let pkt = SuperVec::new();
-        pkt.writeu8(0x02);
-        pkt.writeu8is(schema);
+        let mut pkt = SuperVec::new();
+        pkt.writeu8(0x00, 0x02);
+        pkt.writeu8is(0x01, schema);
         self.send_mysql_packet(0, pkt.get_data());
     }
     
     fn send_cmd_query(&mut self, querystring: &[u8]) {
-        let pkt = SuperVec::new();
-        pkt.writeu8(0x03);
-        pkt.writeu8is(querystring);
+        let mut pkt = SuperVec::new();
+        pkt.writeu8(0x00, 0x03);
+        pkt.writeu8is(0x01, querystring);
         self.send_mysql_packet(0, pkt.get_data());
     }
     
+    /// Switch the current default database to the one specified by schema.
+    ///
+    /// # Contract
+    ///   * error response may be immediately generated before function return
+    ///   * command shall be executed on the server before response is pushed onto stack
     pub fn use_database(&mut self, schema: &[u8]) {
         self.pending_response += 1;
         self.send_cmd_use_database(schema);        
     }
     
+    /// Execute a query string on the remote server. The response will be
+    /// stored in the response stack. The response stack can be access using
+    /// the appropriate function. 
+    ///
+    /// _This function does not cache any data, therefore,
+    /// the query string is guaranteed to be transmitted to the server._
+    ///
+    /// # Contract
+    ///   * no cache shall be used for query results
+    ///   * query string shall be transmitted to the remote server for execution
+    ///   * query may not be immediately executed
+    ///   * query shall be executed by successive calling of tick; if not by call return
+    ///   * responses shall be placed on stack in order this function is called
+    ///   * query string shall not be checked for validity
+    ///   * error type response may be generated immediately before return 
     pub fn query(&mut self, querystring: &[u8]) {
+        
         self.pending_response += 1;
         self.send_cmd_query(querystring);
     }
+    
+    /// Return the oldest response on the response stack. A response
+    /// is a answer from the server. It is produced following any command
+    /// and may be a simulated response that does not originate from the
+    /// server.
+    ///
+    /// # Contract
+    ///   * response may not be available 
+    ///   * response is not checked for validity
+    ///   * response may be an error
+    pub fn pop_response(&mut self) -> Option<Response> {
+        self.responses.pop()
+    }
 
-    fn onpacket(&mut self, num: u8, pkt: &[u8]) {
+    fn onpacket(&mut self, pktnum: u8, pkt: &[u8]) {
         let pktsv = SuperVec::from_slice(pkt);
         
         let op = pkt[0];
@@ -176,25 +204,25 @@ impl MySQLConnection {
             }
             
             if pktnum > 1 && pktnum < 2 + self.number_of_fields {
-                let mut sz = 0;
-                let mut pos = 0;
+                let mut sz: usize = 0;
+                let mut pos: usize = 0;
                 
-                sz = pktsv.readu8(pos);
+                sz = pktsv.readu8(pos) as usize;
                 let catalog = pktsv.readu8i(pos + 1, sz);
                 pos += sz + 1;
-                sz = pktsv.readu8(pos);
+                sz = pktsv.readu8(pos) as usize;
                 let database = pktsv.readu8i(pos + 1, sz);
                 pos += sz + 1;
-                sz = pktsv.readu8(pos);
+                sz = pktsv.readu8(pos) as usize;
                 let table = pktsv.readu8i(pos + 1, sz);
                 pos += sz + 1;
-                sz = pktsv.readu8(pos);
+                sz = pktsv.readu8(pos) as usize;
                 let origtable = pktsv.readu8i(pos + 1, sz);
                 pos += sz + 1;                
-                sz = pktsv.readu8(pos);
+                sz = pktsv.readu8(pos) as usize;
                 let name = pktsv.readu8i(pos + 1, sz);
                 pos += sz + 1;
-                sz = pktsv.readu8(pos);
+                sz = pktsv.readu8(pos) as usize;
                 let origname = pktsv.readu8i(pos + 1, sz);
                 pos += sz + 1;
                                 
@@ -214,7 +242,7 @@ impl MySQLConnection {
                 
                 let decimals = pktsv.readu8(pos);                
                 
-                self.field_headers[pktnum - 2] = FieldHeader::Normal {
+                self.field_headers[(pktnum - 2) as usize] = FieldHeader::Normal {
                     catalog:        catalog,
                     database:       database,
                     table:          table,
@@ -228,12 +256,14 @@ impl MySQLConnection {
                         0xfe => ServerFieldType::String,
                         0x08 => ServerFieldType::LongLong,
                         0xfd => ServerFieldType::VarString,
+                        _ => panic!("unknown mysql field type"),
                     },
-                    type:           match ftype {
+                    itype:           match ftype {
                         0x03 => FieldType::Integer,
                         0xfe => FieldType::String,
                         0x08 => FieldType::Integer,
                         0xfd => FieldType::String, 
+                        _ => panic!("unknown mysql field type"),
                     },
                     flags:          flags,
                     decimals:       decimals,                    
@@ -249,24 +279,55 @@ impl MySQLConnection {
                 return                
             }
             
+            if pktsv.readu8(0) == 0xfe {
+                // We should have received the last record, therefore,
+                // let us push these records as a response for the user
+                // code to fetch, and clear out state machine.
+                let mut empty_records_vec: Vec<Record> = Vec::new();
+                mem::swap(&mut self.pending_records, &mut empty_records_vec);
+                self.responses.push(Response::Table { records: empty_records_vec });
+                self.number_of_fields = 0;
+                self.pending_response -= 1;
+                return;
+            }
+            
             let recnum = pktnum - (2 + self.number_of_fields);
             let mut pos = 0;
-            let fields: Vec<Field> = Vec::new();        
+            let mut fields: Vec<Field> = Vec::new();        
             
             for x in 0..self.number_of_fields {
-                let sz = pktsv.readu8(pos);
+                let sz = pktsv.readu8(pos) as usize;
                 let data = pktsv.readu8i(pos + 1, sz);
-                let field = &self.field_headers[x];
-                fields.push(match field.type {
-                    FieldType::Integer => {
-                        Field::i64(String::from_utf8(data).parse::<i64>())
-                    },
-                    FieldType::String => {
-                        Field::String(String::from_utf8(data))
-                    },
+                let field = &mut self.field_headers[x as usize];
+                fields.push(match field {
+                    &mut FieldHeader::Normal {
+                        ref catalog,
+                        ref database,
+                        ref table,
+                        ref origtable,
+                        ref name,
+                        ref origname,
+                        ref charset,
+                        ref len,
+                        ref stype,
+                        ref itype,
+                        ref flags,
+                        ref decimals
+                    } =>
+                        match itype {
+                            &FieldType::Integer => {
+                                Field::i64(String::from_utf8(data).unwrap().parse::<i64>().unwrap())
+                            },
+                            &FieldType::String => {
+                                Field::String(String::from_utf8(data).unwrap())
+                            },
+                        },
+                    &mut FieldHeader::Empty => Field::Unknown,
                 });
                 pos += sz + 1;  
-            }                        
+            }
+            
+            self.pending_records.push(Record { fields: fields });
         }
 
         match op {
@@ -362,6 +423,21 @@ impl MySQLConnection {
         }
     }
 
+    /// Read any data from the network socket, and write any pending data
+    /// to the network socket. This will block if `netblock` is set to true
+    /// until a network packet arrives. This function returning does not
+    /// guarantee that a response is on the response stack.
+    ///
+    ///
+    /// # Why Block with `netblock`
+    /// The ability to block provides the calling code with a method to place
+    /// the thread into sleep mode if supported by the operating system. This
+    /// is the only alternative to polling.
+    ///
+    /// # Contract
+    ///   * no user code side network transmits or receives shall happen until called
+    ///   * no network connection establishment shall happen until called
+    ///   * network traffic may happen on system side of socket between calls
     pub fn tick(&mut self, netblock: bool) {
         loop {
             let result = self.socket.recvex(netblock);
@@ -430,7 +506,8 @@ impl MySQLConnection {
         }
     }
 
-    pub fn send_pending_query(&mut self) {
+    
+    fn send_pending_query(&mut self) {
        println!("[mysql.send_pending_query] checking if socket is connected");
         if !self.socket.is_connected() {
            println!("[mysql] doing connection to {}:{}", self.remote_ip, self.remote_port);

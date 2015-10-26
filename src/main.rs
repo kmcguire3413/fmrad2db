@@ -55,7 +55,6 @@ fn test_net_tcp_mysql() {
     );
     println!("created mysql connection instance");
 
-    mysqlconn.query("SELECT * FROM test");
     mysqlconn.tick(true);
     
     net.recv();
