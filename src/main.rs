@@ -2,29 +2,32 @@
 #![feature(convert)]
 #![allow(dead_code)]
 #![allow(unused_variables)]
-pub extern crate pcap;
+extern crate pcap;
+extern crate byteorder;
 
 pub mod net;
 pub mod common;
 
 use std::sync::{Arc, Mutex, Condvar};
-use net::TcpSocketMessage;
+use net::{Net, TcpSocketMessage};
+use net::mysql;
 
+fn create_net_instance() -> Net {
+    net::new_net(vec![0xec, 0x55, 0xf9, 0x7a, 0x54, 0x70], 0xc0a8010d, vec![0x94, 0x10, 0x3e, 0xfc, 0xc6, 0xf2])
+}
 
-
-//#[test]
+#[test]
 fn test_net_tcp_http() {
 	/*
 		Start the network.
 	*/
-	let net_instance = net::new_net(vec![0xec, 0x55, 0xf9, 0x7a, 0x54, 0x70], 0xc0a8020c, vec![0x94, 0x10, 0x3e, 0xfd, 0x55, 0x69]);
+	let net_instance = create_net_instance();
 
 	/*
 		Create a TCP socket and connect to a remote machine.
 	*/
 	let mut socket = net_instance.new_tcp_socket();
 
-	//socket.connect(vec![0x94, 0x10, 0x3e, 0xfc, 0xc6, 0xf2], 0, 0xc0a80101, 80);
 	socket.connect(0x689cf603, 80);
 
 	match socket.sys_recv() {
@@ -41,6 +44,23 @@ fn test_net_tcp_http() {
    net_instance.shutdown();
 }
 
+fn test_net_tcp_mysql() {
+    let net = create_net_instance();
+    let mut mysqlconn = mysql::MySQLConnection::new_with_ipv4_tcp(
+        &net,
+        0x689cf603,
+        3306,
+        "fm2db".as_bytes().iter().cloned().collect(),
+        "Mxn3k2eoo3LsmxSaj3KMnrE3".as_bytes().iter().cloned().collect()
+    );
+    println!("created mysql connection instance");
+
+    mysqlconn.query("SELECT * FROM test");
+    mysqlconn.tick(true);
+    
+    net.recv();
+}
+
 fn main() {
-    test_net_tcp_http();
+    test_net_tcp_mysql();
 }

@@ -17,6 +17,7 @@ extern crate std;
 
 mod packets;
 mod tcp;
+pub mod mysql;
 
 use std::thread::JoinHandle;
 use std::sync::mpsc::{Sender, Receiver, channel};
@@ -30,10 +31,15 @@ use super::pcap::Device;
 use super::pcap::Active;
 
 pub use super::common::SuperVec;
+
 pub use self::tcp::TcpSocketMessage;
 pub use self::tcp::TcpSocketSystem;
 pub use self::tcp::TcpSocket;
+pub use self::tcp::TcpSocketReadError;
+
 pub use self::packets::EthIp4TcpPacket;
+
+//pub use self::mysql::MySQLConnection;
 
 
 pub enum NetOp {
@@ -480,6 +486,10 @@ pub struct Net {
 }
 
 impl Net {
+    pub fn recv(&self) -> NetOp {
+        self.rx.recv().unwrap()
+    }    
+    
     pub fn shutdown(self) {
         println!("[net::Net::shutdown] doing shutdown procedure.. <not implemented>");
         self.tx.send(NetOp::Shutdown);

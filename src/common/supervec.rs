@@ -2,7 +2,6 @@
 	A randomly readable vector that automatically resizes as
 	data is written into it. It supports reading and writing
     integers and byte arrays in different endianess.
-
 	At the moment it is unoptimized, but if needed later it
 	will support pre-allocation to a specific capacity, and
 	do resizing per method instead of for each byte written.
@@ -27,6 +26,13 @@ impl SuperVec {
 			data: v8.to_vec()
 		}
 	}
+	pub fn from_slice(v8: &[u8]) -> SuperVec {
+	    let mut data: Vec<u8> = Vec::new();
+	    for x in 0..v8.len() {
+	       data.push(v8[x]);
+	    }
+	    SuperVec { data: data }
+	}
 	pub fn len(&self) -> usize {
 		self.data.len()
 	}
@@ -45,10 +51,18 @@ impl SuperVec {
 		self.writeu8(o + 1, v as u8);
 		self.writeu8(o + 0, (v >> 8) as u8);
 	}
+	pub fn writeu24le(&mut self, o: usize, v: u32) {
+	    self.writeu8(o + 0, v as u8);
+	    self.writeu16le(o + 1, (v >> 8) as u16);
+	}	
 	pub fn writeu32be(&mut self, o: usize, v: u32) {
 		self.writeu16be(o + 2, v as u16);
 		self.writeu16be(o + 0, (v >> 16) as u16);
 	}
+	pub fn writeu32le(&mut self, o: usize, v: u32) {
+		self.writeu16be(o + 0, v as u16);
+		self.writeu16be(o + 2, (v >> 16) as u16);
+	}	
 	pub fn writeu8i(&mut self, o: usize, v: &Vec<u8>) {
 		self.writeu8is(o, v.as_slice());
 	}
@@ -63,6 +77,16 @@ impl SuperVec {
 			v8.push(self.readu8(o + x));
 		}
 		v8
+	}
+	pub fn readuntil(&self, o: usize, m: u8) -> Vec<u8> {
+	    let mut v8: Vec<u8> = Vec::new();
+	    for x in 0..self.data.len() {
+	        if self.data[x] == m {
+	            break;
+	        }
+	        v8.push(self.data[x]);
+	    }
+	    v8
 	}
 	pub fn readu8(&self, o: usize) -> u8 {
 		if o >= self.data.len() {
@@ -80,6 +104,12 @@ impl SuperVec {
 	}
 	pub fn readu16be(&self, o: usize) -> u16 {
 		((self.readu8(o + 0) as u16) << 8) | self.readu8(o + 1) as u16
+	}
+	pub fn readu24le(&self, o: usize) -> u32 {
+	    (self.readu8(o + 0) as u32) | ((self.readu16be(o + 1) as u32) << 16)
+	}
+	pub fn readu32le(&self, o: usize) -> u32 {
+	    ((self.readu16be(o + 2) as u32) << 16) | self.readu16be(o + 0) as u32
 	}
 	pub fn readu32be(&self, o: usize) -> u32 {
 		((self.readu16be(o + 0) as u32) << 16) | self.readu16be(o + 2) as u32

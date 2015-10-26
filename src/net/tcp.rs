@@ -1,4 +1,4 @@
-use std::sync::mpsc::{Sender, Receiver, channel};
+use std::sync::mpsc::{Sender, Receiver, channel, TryRecvError};
 use std::sync::atomic::{AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
 
 use super::NetOp;
@@ -53,11 +53,12 @@ pub struct TcpSocket {
     net_tx:                 Sender<NetOp>,
 }
 
+#[derive(Debug)]
 pub enum TcpSocketReadError {
     EndOfStream,
     Disconnected,
     Unknown,
-   NoData,
+    NoData,
 }
 
 impl TcpSocket {
@@ -139,11 +140,38 @@ impl TcpSocket {
               their meaning for TcpSocketReadError
     */
     pub fn recv(&mut self) -> Result<Vec<u8>, TcpSocketReadError> {
-        loop {
+        self.recvex(false)
+    }
+    
+    pub fn recvblock(&mut self) -> Result<Vec<u8>, TcpSocketReadError> {
+        self.recvex(true)
+    }
+    
+    fn sockrecv(&mut self, block: bool) -> Result<TcpSocketMessage, TcpSocketReadError> {
+        if block {
+            let result = self.rx.recv();
+            match result {
+                Result::Err(error) => Result::Err(TcpSocketReadError::Disconnected),
+                Result::Ok(sockmsg) => Result::Ok(sockmsg),
+            }
+        } else {
             let result = self.rx.try_recv();
+            match result {
+                Result::Err(error) => match error {
+                    TryRecvError::Empty => Result::Err(TcpSocketReadError::NoData),
+                    TryRecvError::Disconnected => Result::Err(TcpSocketReadError::Disconnected),
+                }, 
+                Result::Ok(sockmsg) => Result::Ok(sockmsg),
+            }
+        }
+    }
+    
+    pub fn recvex(&mut self, block: bool) -> Result<Vec<u8>, TcpSocketReadError> {
+        loop {
+            let result = self.sockrecv(block);
             println!("$$$ user side tcp socket got message");
             match result {
-                Result::Err(error) => break,
+                Result::Err(error) => return Result::Err(error),
                 Result::Ok(sockmsg) => {
                     match sockmsg {
                         TcpSocketMessage::Data(v8) => {
@@ -165,8 +193,6 @@ impl TcpSocket {
                 }
             }
         }
-
-        Result::Err(TcpSocketReadError::NoData)
     }
 
     pub fn is_connected(&self) -> bool {
