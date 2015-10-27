@@ -1,3 +1,8 @@
+// ALL RIGHTS RESERVED 2015 
+// LEONARD KEVIN MCGUIRE JR. <kmcg3413@gmail.com>
+// 242 EAST SKIPPER ROAD
+// ECLECTIC, AL 36024
+
 /*
 	A randomly readable vector that automatically resizes as
 	data is written into it. It supports reading and writing

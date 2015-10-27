@@ -39,7 +39,7 @@ pub enum TcpSocketMessage {
     Data(Vec<u8>),
     Connect { dstip: u32, dstport: u16 },
     Disconnect,
-
+    Error,
     Disconnected,
     Connected,
     EndOfStream,
@@ -126,79 +126,79 @@ impl TcpSocket {
         self.net_tx.send(NetOp::Ip4TcpSocketNotify { handle: self.handle });
     }
 
-    pub fn sys_recv(&mut self) -> TcpSocketMessage {
+    pub unsafe fn sys_recv(&mut self) -> TcpSocketMessage {
         self.rx.recv().unwrap()
     }    
     
-    /*
-        SPEC:
-            (1) We _shall_ not block.
-            (2) We _shall_ report all reasons if data could not be returned.
-            (3) Any status or error shall be reported before data is returned.
-
-        TODO: develop better specification for error messages and
-              their meaning for TcpSocketReadError
-    */
-    pub fn recv(&mut self) -> Result<Vec<u8>, TcpSocketReadError> {
+    /// Receive any data or control messages on the socket without blocking.
+    ///
+    /// Contract:
+    ///   * shall not block
+    ///   * may return control message instead of data
+    ///   * shall report all reasons data could not be returned
+    ///   * message will be returned in order received        
+    pub fn recv(&mut self) -> TcpSocketMessage {
         self.recvex(false)
     }
     
-    pub fn recvblock(&mut self) -> Result<Vec<u8>, TcpSocketReadError> {
+    /// Receive any data or control message on the socket, or block until
+    /// data or a control message arrives.
+    pub fn recvblock(&mut self) -> TcpSocketMessage {
         self.recvex(true)
     }
     
-    fn sockrecv(&mut self, block: bool) -> Result<TcpSocketMessage, TcpSocketReadError> {
+    /// Provides ergonomic adapter between blocking and non-blocking
+    /// channel reading from system side socket structure.
+    fn sockrecv(&mut self, block: bool) -> TcpSocketMessage {
         if block {
             let result = self.rx.recv();
             match result {
-                Result::Err(error) => Result::Err(TcpSocketReadError::Disconnected),
-                Result::Ok(sockmsg) => Result::Ok(sockmsg),
+                Result::Err(error) => TcpSocketMessage::Error,
+                Result::Ok(sockmsg) => sockmsg,
             }
         } else {
             let result = self.rx.try_recv();
             match result {
                 Result::Err(error) => match error {
-                    TryRecvError::Empty => Result::Err(TcpSocketReadError::NoData),
-                    TryRecvError::Disconnected => Result::Err(TcpSocketReadError::Disconnected),
+                    TryRecvError::Empty => TcpSocketMessage::EndOfStream,
+                    TryRecvError::Disconnected => TcpSocketMessage::Disconnected,
                 }, 
-                Result::Ok(sockmsg) => Result::Ok(sockmsg),
+                Result::Ok(sockmsg) => sockmsg,
             }
         }
     }
     
-    pub fn recvex(&mut self, block: bool) -> Result<Vec<u8>, TcpSocketReadError> {
-        loop {
-            let result = self.sockrecv(block);
-            println!("$$$ user side tcp socket got message");
-            match result {
-                Result::Err(error) => return Result::Err(error),
-                Result::Ok(sockmsg) => {
-                    match sockmsg {
-                        TcpSocketMessage::Data(v8) => {
-                            return Result::Ok(v8);
-                        },
-                        TcpSocketMessage::Connected => {
-                            self.connected = true;
-                        },
-                        TcpSocketMessage::Disconnected => {
-                            return Result::Err(TcpSocketReadError::Disconnected);
-                        },
-                        _ => {
-                            /*
-                                TODO: implement any remaining messages
-                            */
-                            continue;
-                        }
-                    }
-                }
-            }
+    /// Provides ability to receive socket data or message with argument to
+    /// specify if we shall block until data or control message arrives.
+    ///
+    /// # Panics
+    /// This method will panic if it receives any message that was not intended
+    /// to be received for debugging purposes.
+    pub fn recvex(&mut self, block: bool) -> TcpSocketMessage {
+        let mut sockmsg = self.sockrecv(block);
+        match sockmsg {
+            TcpSocketMessage::Data(v8) => TcpSocketMessage::Data(v8),
+            TcpSocketMessage::Connected => {
+                self.connected = true;
+                sockmsg
+            },
+            TcpSocketMessage::Disconnected => {
+                self.connected = false;
+                sockmsg
+            },
+            TcpSocketMessage::Connect {dstip, dstport } => panic!("[tcp-socket-user] got TcpSocketMessage::Connect"),
+            TcpSocketMessage::Disconnect => panic!("[tcp-socket-user] got TcpSocketMessage::Connect"),
+            TcpSocketMessage::Error => sockmsg,
+            TcpSocketMessage::EndOfStream => sockmsg, 
         }
     }
 
+    /// Denotes if the socket is under the impression that it is still connected.
     pub fn is_connected(&self) -> bool {
         self.connected
     }
 
+    /// Attempt a connection with the remote server.
     pub fn connect(&self, dstip: u32, dstport: u16) {
         /*
             (1) Place the command onto the socket's system message queue.
@@ -516,6 +516,7 @@ impl TcpSocketSystem {
 
         self.net_tx.send(NetOp::SendEth8023Packet(data));
     }
+    
     pub fn try_connect(&mut self) {
         let mut pkt = EthIp4TcpPacket::default();
 

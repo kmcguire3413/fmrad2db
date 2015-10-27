@@ -1,3 +1,8 @@
+// ALL RIGHTS RESERVED 2015 
+// LEONARD KEVIN MCGUIRE JR. <kmcg3413@gmail.com>
+// 242 EAST SKIPPER ROAD
+// ECLECTIC, AL 36024
+
 #![feature(negate_unsigned)]
 #![feature(convert)]
 #![allow(dead_code)]
@@ -55,7 +60,26 @@ fn test_net_tcp_mysql() {
     );
     println!("created mysql connection instance");
 
-    mysqlconn.tick(true);
+    loop {
+        mysqlconn.tick(true);
+        let oresp = mysqlconn.pop_response();
+        match oresp {
+            Option::Some(resp) => match resp {
+                mysql::Response::Table { records } => {
+                    println!("got table response {}", records.len());
+                },
+                mysql::Response::Error => (),
+                mysql::Response::Success => (),
+                mysql::Response::LoginError => {
+                    println!("mysql server login failed");
+                },
+                mysql::Response::LoginSuccess => {
+                    println!("mysql server login was good");
+                },
+            },
+            Option::None => (),
+        }
+    }
     
     net.recv();
 }
