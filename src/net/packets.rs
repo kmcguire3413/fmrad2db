@@ -86,8 +86,8 @@ impl EthIp4TcpPacket {
 
 		self.write_tcp_checksum(0 as u16);
 
-		println!("ip_total_length:{}", self.read_ip_total_length());
-		println!("tcp_offset:{}", tcp_offset);
+		//println!("ip_total_length:{}", self.read_ip_total_length());
+		//println!("tcp_offset:{}", tcp_offset);
 
 		let ip_hdr_size = self.read_ip_hdrlen() as u32 * 4;
 
@@ -100,7 +100,7 @@ impl EthIp4TcpPacket {
 		}
 
 		if tcp_len & 1 > 0 {
-			println!("ODD BALL");
+			//println!("ODD BALL");
 			let lastbyte = self.data.len() - 1;
 			sum += (self.data.readu8(lastbyte) as u32) << 8;
 		}
@@ -112,7 +112,7 @@ impl EthIp4TcpPacket {
 
 		sum += self.data.readu8(0x17) as u32;
 
-		println!("tcp_len:{}", tcp_len);
+		//println!("tcp_len:{}", tcp_len);
 
 		sum += tcp_len as u32;
 
@@ -120,7 +120,7 @@ impl EthIp4TcpPacket {
 			sum = (sum & 0xffff) + (sum >> 16);
 		}
 
-		println!("sum:{}", sum );
+		//println!("sum:{}", sum );
 
 		self.write_tcp_checksum((!sum) as u16);
 	}

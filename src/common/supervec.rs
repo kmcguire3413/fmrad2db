@@ -83,13 +83,14 @@ impl SuperVec {
 		}
 		v8
 	}
-	pub fn readuntil(&self, o: usize, m: u8) -> Vec<u8> {
+	pub fn readuntil(&self, mut o: usize, m: u8) -> Vec<u8> {
 	    let mut v8: Vec<u8> = Vec::new();
-	    for x in 0..self.data.len() {
-	        if self.data[x] == m {
+	    while o < self.data.len() {
+	        if self.data[o] == m {
 	            break;
 	        }
-	        v8.push(self.data[x]);
+	        v8.push(self.data[o]);
+	        o += 1;
 	    }
 	    v8
 	}

@@ -265,8 +265,6 @@ impl TcpSocketSystem {
     }
 
     pub fn onpacket(&mut self, pkt: EthIp4TcpPacket) {
-     println!("tcp socket is processing message");
-
      if pkt.read_tcp_flags() & 0x10 != 0 {
          self.txstate = TcpChannelState::Connected;
          self.tx.send(TcpSocketMessage::Connected);
@@ -312,12 +310,12 @@ impl TcpSocketSystem {
 
      let data_offset = pkt.read_tcp_offset() + pkt.read_tcp_hdrlen() as usize * 4;
 
-     println!("tcp_offset:{} data_offset:{} hdrlen:{} pkt.len():{}",
-         pkt.read_tcp_offset(),
-         data_offset,
-         pkt.read_tcp_hdrlen() * 4,
-         pkt.len()
-     );
+     //println!("tcp_offset:{} data_offset:{} hdrlen:{} pkt.len():{}",
+     //    pkt.read_tcp_offset(),
+     //    data_offset,
+     //    pkt.read_tcp_hdrlen() * 4,
+     //    pkt.len()
+     //);
 
      if data_offset >= pkt.len() {
          return;
@@ -335,14 +333,14 @@ impl TcpSocketSystem {
 
      let payload = pkt.data.readu8i(data_offset, last_ip_payload_byte - data_offset);
 
-     println!("PAYLOAD:{}", payload.len());
+     //println!("PAYLOAD:{}", payload.len());
 
      /*
          If this does not match out expected acknowledgement value,
          then let us store it away, and wait for the missing piece.
      */
      if pkt.read_tcp_sequence() != self.ack {
-         println!("packet out of order; delaying pkt.seq{} self.ack:{}", pkt.read_tcp_sequence(), self.ack);
+         //println!("packet out of order; delaying pkt.seq{} self.ack:{}", pkt.read_tcp_sequence(), self.ack);
          /*
              Go ahead and let the remote end know that we received this packet.
 
@@ -360,7 +358,7 @@ impl TcpSocketSystem {
 
      self.ack += payload.len() as u32;
 
-     println!("@@@ [tcp-socket] sent TX message with payload");
+     //println!("@@@ [tcp-socket] sent TX message with payload");
      self.tx.send(TcpSocketMessage::Data(payload));
 
      /*
@@ -508,12 +506,15 @@ impl TcpSocketSystem {
         pkt.compute_ip_checksum();
         pkt.compute_tcp_checksum();
 
-        let mut data = pkt.get_data();
+        println!("socket sequence is {} and data.len is {}", self.seq, data.len());
 
         self.seq += data.len() as u32;
+        
+        println!("socket sequence is now {}", self.seq);
 
-        println!("socket sending data!!!");
-
+        //println!("socket sending data!!!");
+        
+        let mut data = pkt.get_data();
         self.net_tx.send(NetOp::SendEth8023Packet(data));
     }
     
@@ -537,7 +538,7 @@ impl TcpSocketSystem {
 
         let mut data = pkt.get_data();
 
-        println!("pkt.get_data.len():{}", data.len());
+        //println!("pkt.get_data.len():{}", data.len());
 
         self.seq += 1;
 

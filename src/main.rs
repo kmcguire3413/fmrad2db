@@ -18,7 +18,7 @@ use net::{Net, TcpSocketMessage};
 use net::mysql;
 
 fn create_net_instance() -> Net {
-    net::new_net(vec![0xec, 0x55, 0xf9, 0x7a, 0x54, 0x70], 0xc0a8010d, vec![0x94, 0x10, 0x3e, 0xfc, 0xc6, 0xf2])
+    net::new_net(vec![0xec, 0x55, 0xf9, 0x7a, 0x54, 0x70], 0xc0a80124, vec![0x94, 0x10, 0x3e, 0xfc, 0xc6, 0xf2])
 }
 
 #[test]
@@ -75,6 +75,8 @@ fn test_net_tcp_mysql() {
                 },
                 mysql::Response::LoginSuccess => {
                     println!("mysql server login was good");
+                    mysqlconn.use_database("fm2db".as_bytes().to_vec());
+                    mysqlconn.query("select * from test".as_bytes().to_vec());
                 },
             },
             Option::None => (),

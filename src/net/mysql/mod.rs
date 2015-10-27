@@ -200,7 +200,6 @@ impl MySQLConnection {
         pkt.writeu8(0x00, 0x02);
         pkt.writeu8is(0x01, schema);
         self.send_mysql_packet(0, pkt.get_data());
-        self.pending_cmds_sent += 1;
     }
     
     fn send_cmd_query(&mut self, querystring: &[u8]) {
@@ -208,7 +207,6 @@ impl MySQLConnection {
         pkt.writeu8(0x00, 0x03);
         pkt.writeu8is(0x01, querystring);
         self.send_mysql_packet(0, pkt.get_data());
-        self.pending_cmds_sent += 1;
     }
     
     /// Switch the current default database to the one specified by schema.
@@ -266,14 +264,14 @@ impl MySQLConnection {
                 // The pending response was an error.
                 self.responses.push(Response::Error);
                 self.pending_cmds.remove(0);
-                self.pending_cmds_sent -= 1;
+                //self.pending_cmds_sent -= 1;
                 return;
             } 
             
             if pktnum == 1 && pktsv.readu8(0) == 0 {
                 self.responses.push(Response::Success);
                 self.pending_cmds.remove(0);
-                self.pending_cmds_sent -= 1;
+                //self.pending_cmds_sent -= 1;
                 return;
             }
             
@@ -370,7 +368,7 @@ impl MySQLConnection {
                 self.responses.push(Response::Table { records: empty_records_vec });
                 self.number_of_fields = 0;
                 self.pending_cmds.remove(0);
-                self.pending_cmds_sent -= 1;
+                //self.pending_cmds_sent -= 1;
                 return;
             }
             
@@ -432,7 +430,7 @@ impl MySQLConnection {
             /* https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::Handshake */
             let mut pos: usize = 0;
             let protocol = pktsv.readu8(pos);
-            pos += 1;   
+            pos += 1;
             let version = pktsv.readuntil(pos, 0);
             pos += version.len() + 1;
             let threadid = pktsv.readu32le(pos);
@@ -450,6 +448,10 @@ impl MySQLConnection {
             pos += salt1.len() + 1;
             let plugin = pktsv.readuntil(pos, 0);
             pos += plugin.len() + 1;      
+            
+            println!("salt0.len:{} salt1.len:{}",
+                salt0.len(), salt1.len()
+            );
                                       
             /* forge our reply */
             let mut reply = SuperVec::new();
@@ -461,7 +463,7 @@ impl MySQLConnection {
             pos += 2;
             reply.writeu16le(pos, 0x000f);
             pos += 2;
-            reply.writeu32le(pos, 0x01000000);
+            reply.writeu32le(pos, 0x10000000);
             pos += 4;
             /* utf8 */
             reply.writeu8(pos, 0x21);
@@ -474,33 +476,44 @@ impl MySQLConnection {
             pos += 1;
             /* encode password */
             let mut sha1 = sha1::Sha1::new();
-            println!("[mysql] doing scramble");
-            // get scramble                
-            let mut scramble = salt1.clone();                
+            println!("[mysql] doing scramble on password of length {}", self.pass.len());
             
+            // The scramble is both salt fields as one which produces
+            // a twenty byte sequence that is the same length as the
+            // SHA1 output byte sequence. This is important for the
+            // XOR operation that happens further below.       
+            let mut scramble = salt0.clone();
+            let mut scramble_more = salt1.clone();
+            scramble.append(&mut scramble_more);
+            
+            // The password is hashed twice with SHA1 and both
+            // stages are used in producing the authentication
+            // token.
             sha1.reset();
             sha1.update(self.pass.as_slice());
-            let hashed = sha1.digest();
-            
+            let hash_stage1 = sha1.digest();
             sha1.reset();
-            sha1.update(hashed.as_slice());                
-            let dhashed = sha1.digest();
+            sha1.update(hash_stage1.as_slice());                
+            let hash_stage2 = sha1.digest();
             
+            // We hash the scramble with the stage two hash
+            // appended onto it. 
             sha1.reset();
-            scramble.append(&mut dhashed.clone());
             sha1.update(scramble.as_slice());
+            sha1.update(hash_stage2.as_slice());
             let mut tfinal = sha1.digest();
             
+            // XOR is the final process using the stage one hash.
             println!("[mysql] doing xor");
-            for x in 0..tfinal.len() {
-                tfinal[x] = tfinal[x] ^ hashed[x % hashed.len()];
+            for x in 0..hash_stage1.len() {
+                tfinal[x] = tfinal[x] ^ hash_stage1[x % hash_stage1.len()];
             }
             
             println!("[mysql] writing scramble into reply");
             reply.writeu8(pos, tfinal.len() as u8);
             pos += 1;
             reply.writeu8i(pos, &tfinal);
-            pos += scramble.len();
+            pos += tfinal.len();
             
             /* TODO: fix this up... it is a UTF-8 string that says "mysql_native_password" with a
                      NULL (0x00) at the end..
@@ -518,9 +531,16 @@ impl MySQLConnection {
     fn tick_pending_cmd_queue(&mut self) {
         let mut tmp: Vec<PendingCommand> = Vec::new();
 
-        mem::swap(&mut tmp, &mut self.pending_cmds);        
+        mem::swap(&mut tmp, &mut self.pending_cmds);
+                
+        println!("self.pending_cmds_sent:{} self.pending_cmds.len():{}",
+            self.pending_cmds_sent,
+            tmp.len()
+        );
         
-        for x in (self.pending_cmds_sent as usize)..tmp.len() {
+        let mut x = self.pending_cmds_sent as usize;        
+        while x < tmp.len() {
+            println!("[mysql] transmitting command");
             match &mut tmp[x] {
                 &mut PendingCommand::UseDatabase { ref schema } => {
                     self.send_cmd_use_database(schema.as_slice());             
@@ -529,6 +549,7 @@ impl MySQLConnection {
                     self.send_cmd_query(querystring.as_slice());
                 },
             }
+            x += 1;
             self.pending_cmds_sent += 1;
         }
         
@@ -554,6 +575,7 @@ impl MySQLConnection {
         // https://github.com/kmcguire3413/fmrad2db/issues/8
         if self.connstate.is_idle() && !self.socket.is_connected() {
             self.socket.connect(self.remote_ip, self.remote_port);
+            self.connstate = ConnectionState::Connecting;
             return;
         }
         // If there are any commands which have not been sent, then
@@ -563,12 +585,15 @@ impl MySQLConnection {
         loop {
             let tcpmsg = self.socket.recvex(netblock);
             match tcpmsg {
-                TcpSocketMessage::Data(v8) => self.tick_data(v8),
+                TcpSocketMessage::Data(v8) => {
+                    self.tick_data(v8);
+                    return;
+                },
                 TcpSocketMessage::Connected => {
                     self.connstate = ConnectionState::Connected;
                     // If there are still pending commands then let us
                     // re-issue those commands.
-                    self.pending_cmds_sent = 0;
+                    //self.pending_cmds_sent = 0;
                     self.tick_pending_cmd_queue();
                 },
                 TcpSocketMessage::Disconnected => {
