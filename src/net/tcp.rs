@@ -1,40 +1,60 @@
+///! Implements the TCP socket 
+///!
+///! _This module is currently directly manipulates the entire
+///! TCP/IP stack including the hardware level frame. This is a
+///! current issue. It is hoped that code refactoring can move
+///! and abstract this._
+///!
+///! # Issues
+///!   * https://github.com/kmcguire3413/fmrad2db/issues/1
+
 use std::sync::mpsc::{Sender, Receiver, channel, TryRecvError};
 use std::sync::atomic::{AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
 
 use super::NetOp;
 use super::packets::EthIp4TcpPacket;
 
+/// State of the TCP channel.
 pub enum TcpChannelState {
     Connecting,
     Connected,
     Disconnected,
 }
 
+/// A packet that has not been acknowledged by the remote machine,
+/// and is held in limbo awaiting the possibility of retransmission.
 pub struct TcpSocketHeldPacket {
     seq:                            u32,
     buf:                            Vec<u8>,
 }
 
+/// The system side instance of the TCP socket.
 pub struct TcpSocketSystem {
     txstate:                TcpChannelState,
     rxstate:                TcpChannelState,
-    dst_port:                    u16,
-    src_port:                    u16,
+    dst_port:               u16,
+    src_port:               u16,
     dst_ip:                 u32,
     src_ip:                 u32,
     src_mac:                Vec<u8>,
     dst_mac:                Vec<u8>,
     ack:                    u32,
     seq:                    u32,
-    mtu:                           usize,
-    handle:                        usize,
+    mtu:                    usize,
+    handle:                 usize,
     holding:                Vec<TcpSocketHeldPacket>,
-    tx:                            Sender<TcpSocketMessage>,
-    rx:                            Receiver<TcpSocketMessage>,
+    tx:                     Sender<TcpSocketMessage>,
+    rx:                     Receiver<TcpSocketMessage>,
     net_tx:                 Sender<NetOp>,
     def_gw_mac6:            Vec<u8>,
 }
 
+/// A message structure that is used to communicate
+/// data and control messages to and from the user
+/// code.
+///
+/// # Issues
+///   * https://github.com/kmcguire3413/fmrad2db/issues/6
 pub enum TcpSocketMessage {
     Data(Vec<u8>),
     Connect { dstip: u32, dstport: u16 },
@@ -45,12 +65,13 @@ pub enum TcpSocketMessage {
     EndOfStream,
 }
 
+/// The user side TCP socket instance.
 pub struct TcpSocket {
-    handle:                       usize,
-   connected:              bool,
-    pub tx:                       Sender<TcpSocketMessage>,
-    pub rx:                       Receiver<TcpSocketMessage>,
-    net_tx:                 Sender<NetOp>,
+    handle:                usize,
+    connected:             bool,
+    pub tx:                Sender<TcpSocketMessage>,
+    pub rx:                Receiver<TcpSocketMessage>,
+    net_tx:                Sender<NetOp>,
 }
 
 #[derive(Debug)]
@@ -213,6 +234,12 @@ impl TcpSocket {
 }
 
 impl TcpSocketSystem {
+    /// Create a new TCP socket system side instance. 
+    ///
+    /// This does not create the user side component of the socket, and
+    /// for all intentions shall not. That component would normally inform
+    /// the Net system of the need to create a socket and the Net would
+    /// call this constructor.
     pub fn new(
             dst_ip: u32, src_ip: u32,
             dst_mac: &Vec<u8>, src_mac: &Vec<u8>,
@@ -245,10 +272,20 @@ impl TcpSocketSystem {
         }
     }
 
+    /// Return the unique handle used as an identifier for the socket.
     pub fn get_handle(&self) -> usize {
         self.handle
     }
 
+    /// Check if packet is destined to this socket.
+    ///
+    /// # Issues 
+    ///   * https://github.com/kmcguire3413/fmrad2db/issues/1
+    /// 
+    /// # Contract
+    ///
+    ///   * checks packet fields to match socket parameters
+    ///   * may implement partial specification for stack
     pub fn matches_packet(&self, pkt: &EthIp4TcpPacket) -> bool {
         if self.dst_port == pkt.read_tcp_port_src() &&
             self.src_port == pkt.read_tcp_port_dst() &&
@@ -260,10 +297,18 @@ impl TcpSocketSystem {
         }
     }
 
+    /// Return the TCP source port used by this socket.
     pub fn get_source_port(&self) -> u16 {
         self.src_port
     }
 
+    /// Interprets a packet for data and control information.
+    ///
+    /// # Contract
+    ///   * unsafe for untrusted input
+    ///   * does _NOT_ fully check validity of the packet
+    ///   * shall construct acknowledgement packets
+    ///   * shall maintain TCP socket state
     pub fn onpacket(&mut self, pkt: EthIp4TcpPacket) {
      if pkt.read_tcp_flags() & 0x10 != 0 {
          self.txstate = TcpChannelState::Connected;
@@ -407,6 +452,12 @@ impl TcpSocketSystem {
         start the process over.
      */
     }
+    /// Intended to allow socket to process internal channels for commands
+    /// and data that be waiting.
+    ///
+    /// The data and commands are sent from the user side instance of the
+    /// socket a channel. This function allows the network thread to allow
+    /// _this socket_ to process that channel and any commands or data.
     pub fn onnotify(&mut self) {
         loop {
             let result = self.rx.try_recv();
@@ -444,6 +495,8 @@ impl TcpSocketSystem {
             }
         }
     }
+    
+    /// Send an acknowledgement packet for the acknowledgment number provided.
     pub fn send_ack(&mut self, ack: u32) {
         let mut pkt = EthIp4TcpPacket::default();
 
@@ -464,6 +517,12 @@ impl TcpSocketSystem {
 
         self.net_tx.send(NetOp::SendEth8023Packet(data));
     }
+    
+    /// Send a packet containing data.
+    ///
+    /// # Contract
+    ///   * shall transmit data as soon as possible
+    ///   * will not check if data exceeds network MTU
     pub fn send_data(&mut self, data: &[u8]) {
         let mut pkt = EthIp4TcpPacket::default();
 
@@ -518,6 +577,11 @@ impl TcpSocketSystem {
         self.net_tx.send(NetOp::SendEth8023Packet(data));
     }
     
+    /// Sends a TCP packet with the synchronize flag set to attempt establishment
+    /// of a connection.
+    ///
+    /// # Contract
+    ///   * shall send a TCP packet with the SYN flag set as soon as possible
     pub fn try_connect(&mut self) {
         let mut pkt = EthIp4TcpPacket::default();
 

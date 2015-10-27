@@ -87,7 +87,7 @@ pub enum Response {
     ///   * may contain zero or more records
     ///   * records and fields are not checked for validity
     ///   * this response may be generated locally (not from server)
-    Table { records: Vec<Record> },
+    Table { records: Vec<Record>, headers: Vec<FieldHeader> },
     /// There is no more information that can be provided, but
     /// the operation was successful.
     ///
@@ -407,8 +407,12 @@ impl MySQLConnection {
                 });
                 pos += sz + 1;  
             }
+
+            // Swap out the field headers leaving an empty Vec in place.
+            let tmp: Vec<FieldHeader> = Vec::new();
+            mem::swap(&mut tmp, &mut self.field_headers);            
             
-            self.pending_records.push(Record { fields: fields });
+            self.pending_records.push(Record { fields: fields, headers: tmp });
         }
         
         // Handle a login failure.
