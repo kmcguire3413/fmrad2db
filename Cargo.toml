@@ -5,3 +5,8 @@ authors = ["kmcguire"]
 
 [dependencies.pcap]
 [dependencies.byteorder]
+[dependencies.toml]
+[dependencies.ham]
+git = "https://github.com/kmcguire3413/ham-rs"
+[dependencies.rand]
+[dependencies.time]

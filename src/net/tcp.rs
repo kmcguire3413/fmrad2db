@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
 
 use super::NetOp;
 use super::packets::EthIp4TcpPacket;
+use super::precise_time_ns;
 
 /// State of the TCP channel.
 pub enum TcpChannelState {
@@ -47,6 +48,15 @@ pub struct TcpSocketSystem {
     rx:                     Receiver<TcpSocketMessage>,
     net_tx:                 Sender<NetOp>,
     def_gw_mac6:            Vec<u8>,
+    timeout_marker:         u64,
+}
+
+pub enum DisconnectReason {
+    NotSpecified,
+    InternalError,
+    Timeout,
+    Remote,
+    Local,
 }
 
 /// A message structure that is used to communicate
@@ -60,7 +70,7 @@ pub enum TcpSocketMessage {
     Connect { dstip: u32, dstport: u16 },
     Disconnect,
     Error,
-    Disconnected,
+    Disconnected { reason: DisconnectReason },
     Connected,
     EndOfStream,
 }
@@ -182,7 +192,9 @@ impl TcpSocket {
             match result {
                 Result::Err(error) => match error {
                     TryRecvError::Empty => TcpSocketMessage::EndOfStream,
-                    TryRecvError::Disconnected => TcpSocketMessage::Disconnected,
+                    TryRecvError::Disconnected => TcpSocketMessage::Disconnected { 
+                        reason: DisconnectReason::InternalError
+                    }
                 }, 
                 Result::Ok(sockmsg) => sockmsg,
             }
@@ -203,9 +215,9 @@ impl TcpSocket {
                 self.connected = true;
                 sockmsg
             },
-            TcpSocketMessage::Disconnected => {
+            TcpSocketMessage::Disconnected { reason } => {
                 self.connected = false;
-                sockmsg
+                TcpSocketMessage::Disconnected { reason: reason }
             },
             TcpSocketMessage::Connect {dstip, dstport } => panic!("[tcp-socket-user] got TcpSocketMessage::Connect"),
             TcpSocketMessage::Disconnect => panic!("[tcp-socket-user] got TcpSocketMessage::Connect"),
@@ -252,23 +264,24 @@ impl TcpSocketSystem {
             def_gw_mac6: &Vec<u8>,
     ) -> TcpSocketSystem {
         TcpSocketSystem {
-            txstate:      TcpChannelState::Disconnected,
-            rxstate:      TcpChannelState::Disconnected,
-            ack:          0,
-            seq:          100,
-            dst_port:     dst_port,
-            src_port:     src_port,
-            dst_ip:       dst_ip,
-            src_ip:       src_ip,
-            dst_mac:      dst_mac.clone(),
-            src_mac:      src_mac.clone(),
-            tx:              tx,
-            rx:              rx,
-            net_tx:       net_tx,
-            handle:       handle,
-            mtu:          mtu,
-            holding:      Vec::new(),
-            def_gw_mac6:  def_gw_mac6.clone(),
+            txstate:        TcpChannelState::Disconnected,
+            rxstate:        TcpChannelState::Disconnected,
+            ack:            0,
+            seq:            100,
+            dst_port:       dst_port,
+            src_port:       src_port,
+            dst_ip:         dst_ip,
+            src_ip:         src_ip,
+            dst_mac:        dst_mac.clone(),
+            src_mac:        src_mac.clone(),
+            tx:             tx,
+            rx:             rx,
+            net_tx:         net_tx,
+            handle:         handle,
+            mtu:            mtu,
+            holding:        Vec::new(),
+            def_gw_mac6:    def_gw_mac6.clone(),
+            timeout_marker: precise_time_ns(),
         }
     }
 
@@ -301,6 +314,36 @@ impl TcpSocketSystem {
     pub fn get_source_port(&self) -> u16 {
         self.src_port
     }
+    
+    /// Called to allow the socket to do any periodic work.
+    ///
+    /// # Implementation Contract
+    ///   * no guarantee on calling frequency or interval
+    ///   * calling frequency and interval shall change
+    ///   * shall return control as soon as possible
+    ///
+    /// # Contract
+    ///   * `timeref` shall be in nanosecond units
+    ///   * shall provide no useful functionality directly to the caller system
+    ///   * owner of this socket shall call this periodically
+    ///   * `timeref` shall be as accurate, _as possible_, in time units from last call
+    pub fn periodic_work(&mut self, timerefns: u64) {
+        if timerefns - self.timeout_marker > 1000 * 1000 * 1000 * 60 {
+            // The connection has an inactive period that exceeds the
+            // specified limit, therefore, it shall be closed.
+            self.send_reset();
+            // Clear to prevent the remote end from exploiting any
+            // code paths that cause the connection to continue to function.
+            self.dst_ip = 0;
+            self.dst_port = 0;
+            // Set both channels to the disconnected state.
+            self.txstate = TcpChannelState::Disconnected;
+            self.rxstate = TcpChannelState::Disconnected;
+            // Alert the user side of the socket to this change
+            // in state of the socket and connection.
+            self.tx.send(TcpSocketMessage::Disconnected{ reason: DisconnectReason::Timeout });
+        }
+    }    
 
     /// Interprets a packet for data and control information.
     ///
@@ -341,7 +384,7 @@ impl TcpSocketSystem {
          }
          self.rxstate = TcpChannelState::Disconnected;
          self.txstate = TcpChannelState::Disconnected;
-         self.tx.send(TcpSocketMessage::Disconnected);
+         self.tx.send(TcpSocketMessage::Disconnected { reason: DisconnectReason::Remote });
      }
 
      /*
@@ -351,6 +394,8 @@ impl TcpSocketSystem {
          seq
          ack
      */
+     
+     self.timeout_marker = precise_time_ns();
 
 
      let data_offset = pkt.read_tcp_offset() + pkt.read_tcp_hdrlen() as usize * 4;
@@ -516,6 +561,9 @@ impl TcpSocketSystem {
         let mut data = pkt.get_data();
 
         self.net_tx.send(NetOp::SendEth8023Packet(data));
+    }
+    
+    pub fn send_reset(&mut self) {
     }
     
     /// Send a packet containing data.

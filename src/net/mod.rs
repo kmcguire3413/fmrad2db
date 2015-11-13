@@ -14,10 +14,14 @@
 
 */
 extern crate std;
+extern crate rand;
+extern crate time;
 
 mod packets;
 mod tcp;
 pub mod mysql;
+
+pub use self::time::precise_time_ns;
 
 use std::thread::JoinHandle;
 use std::sync::mpsc::{Sender, Receiver, channel};
@@ -116,17 +120,17 @@ fn worker_net_handle_packet_8023(
 
 	/* ARP ? */
 	if pkt.read_eth_type() == 0x806 {
-		println!("got ARP");
+		//println!("got ARP");
 		/*
 			Is this a request?
 		*/
 		if pkt.read_arp_opcode() == 1 {
-			println!("got ARP request");
+			//println!("got ARP request");
 			/*
 				Is it for our local IPv4 address?
 			*/
 			if pkt.read_arp_target_ipv4() == local_ipv4 {
-				println!("ARP request target ipv4 matches ours");
+				//println!("ARP request target ipv4 matches ours");
 				/*
 					Build and send a reply to let the sender know
 					who we are on the Ethernet layer
@@ -146,7 +150,7 @@ fn worker_net_handle_packet_8023(
 					needed. So we use the `net_tx` channel to fabricate a command
 					to send a packet.
 				*/
-				println!("send ARP reply as {}", local_ipv4);
+				//println!("send ARP reply as {}", local_ipv4);
 				net_tx.send(NetOp::SendEth8023Packet(arp_reply.get_data()));
 				return;
 			}
@@ -190,7 +194,7 @@ fn worker_net_handle_packet_8023(
 		it and how to handle it.
 	*/
 
-	println!("got ip4/tcp packet");
+	//println!("got ip4/tcp packet");
 
 	/*
 		downloading power point comes as a zip file
@@ -202,7 +206,7 @@ fn worker_net_handle_packet_8023(
 		Can we match this up with a current TCP connection
 		instance?
 	*/
-	println!("trying to match packet with socket");
+	//println!("trying to match packet with socket");
 	for tcpsocket in tcpsockets.iter_mut() {
         if tcpsocket.matches_packet(&pkt) {
 		    /*
@@ -211,7 +215,7 @@ fn worker_net_handle_packet_8023(
 		    	TODO: match on IP identification field also?
 		    */
 
-		    println!("packet matched with socket");
+		    //println!("packet matched with socket");
 		    tcpsocket.onpacket(pkt);
 			 return;
 		}
@@ -278,6 +282,9 @@ fn worker_net(
 	let shutdown_copy: Arc<AtomicUsize> = shutdown.clone();
 
 	let net_worker_tx = thread::spawn(move || {
+	    // Initialize the periodic work timer start time. 
+	    let mut tost = precise_time_ns();
+	    
 		loop {
 			let op = rx.recv().unwrap();
 			/*
@@ -288,7 +295,16 @@ fn worker_net(
 						= commands to create connections
 						= commands to send raw packets
 			*/
-			println!("[net-worker] processing message");
+			let curtime = precise_time_ns();
+            if curtime - tost > 60 {
+                // All TCP sockets shall do any periodic work needed.
+                for tcpsocket in tcpsockets.iter_mut() {
+                    tcpsocket.periodic_work(curtime);
+                }
+                tost = curtime;	
+            }
+			
+			//println!("[net-worker] processing message");
 			match op {
 			   NetOp::Shutdown => {
 			       /*
@@ -296,7 +312,7 @@ fn worker_net(
 			           control that they also need to shutdown.
 			       */
 			       shutdown_copy.fetch_add(1, Ordering::Relaxed);
-			       println!("[net-worker] shutdown");
+			       //println!("[net-worker] shutdown");
 			       /*
 			         At the moment I used a hack to duplicate a pointer to
 			         the PCAP object, however, that object may have a routine
@@ -317,7 +333,7 @@ fn worker_net(
                       dependant on 802.3 (Ethernet II framing)
             */
 				NetOp::SendEth8023Packet(v8) => {
-					println!("NetOp.. sent packet {}:{}", v8[0x0c], v8[0x0d]);
+					//println!("NetOp.. sent packet {}:{}", v8[0x0c], v8[0x0d]);
 					cap_clone.sendpacket(v8.as_slice());
 				},
 				NetOp::Eth8023Packet(v8) => {
@@ -362,24 +378,19 @@ fn worker_net(
                 } => {
                     let __net_tx_clone = net_tx_clone.clone();
 
-                    /*
-                        Find an unused local port.
-
-                        TODO: (see OPTIMIZE tag)
-                        OPTIMIZE: <better method>
-                    */
+                    // Find an unused local port.
                     let mut was_good = true;
-                    let mut local_port = 0;
-                    for cur_port in 1025u16..65535u16 {
+                    let mut local_port;
+                    loop {
+                        local_port = rand::random::<u16>();
                         was_good = true;
                         for tcpsocket in tcpsockets.iter() {
-                            if tcpsocket.get_source_port() == cur_port {
+                            if tcpsocket.get_source_port() == local_port {
                                 was_good = false;
                                 break;
                             }
                         }
                         if was_good {
-                            local_port = cur_port;
                             break;
                         }
                     }
@@ -414,40 +425,40 @@ fn worker_net(
 
 					tcpsockets.push(tcpsocket);
             },
-                /*
-                    For a secure environment this needs to disappear. I have left
-                    it since it was the original command to create a socket, and it
-                    offers some flexibility and experimentation.
+            /*
+                For a secure environment this needs to disappear. I have left
+                it since it was the original command to create a socket, and it
+                offers some flexibility and experimentation.
 
-                    TODO: for secure environment have this removed at compile time
-                */
-				NetOp::Ip4TcpSocketRegisterAdv {
-					ipv4,
+                TODO: for secure environment have this removed at compile time
+            */
+			NetOp::Ip4TcpSocketRegisterAdv {
+				ipv4,
+				port,
+				tx,
+				rx,
+				handle,
+				mtu,
+			} => {
+				let __net_tx_clone = net_tx_clone.clone();
+				let mut tcpsocket = TcpSocketSystem::new(
+					0,
+					local_ipv4,
+					&vec![0, 0, 0, 0, 0, 0],
+					&local_mac,
+					0,
 					port,
-					tx,
+					__net_tx_clone,
 					rx,
+					tx,
 					handle,
 					mtu,
-				} => {
-					let __net_tx_clone = net_tx_clone.clone();
-					let mut tcpsocket = TcpSocketSystem::new(
-						0,
-						local_ipv4,
-						&vec![0, 0, 0, 0, 0, 0],
-						&local_mac,
-						0,
-						port,
-						__net_tx_clone,
-						rx,
-						tx,
-						handle,
-						mtu,
-                        &def_gw_mac6,
-					);
+                    &def_gw_mac6,
+				);
 
-					tcpsockets.push(tcpsocket);
-				},
-			}
+				tcpsockets.push(tcpsocket);
+			},
+	      }
 		}
 	});
 
@@ -456,7 +467,7 @@ fn worker_net(
 	       break;
 	   }	    
 	    
-		println!("recv packet");
+		//println!("recv packet");
 		let mut v8: Vec<u8> = Vec::new();
 		/*
 			This function is still unstable:

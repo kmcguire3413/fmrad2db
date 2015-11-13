@@ -364,8 +364,13 @@ impl MySQLConnection {
                 // let us push these records as a response for the user
                 // code to fetch, and clear out state machine.
                 let mut empty_records_vec: Vec<Record> = Vec::new();
+                let mut tmp: Vec<FieldHeader> = Vec::new();
+                
                 mem::swap(&mut self.pending_records, &mut empty_records_vec);
-                self.responses.push(Response::Table { records: empty_records_vec });
+                // Swap out the field headers leaving an empty Vec in place.
+                mem::swap(&mut tmp, &mut self.field_headers);
+                                     
+                self.responses.push(Response::Table { records: empty_records_vec, headers: tmp });
                 self.number_of_fields = 0;
                 self.pending_cmds.remove(0);
                 //self.pending_cmds_sent -= 1;
@@ -406,13 +411,9 @@ impl MySQLConnection {
                     &mut FieldHeader::Empty => Field::Unknown,
                 });
                 pos += sz + 1;  
-            }
-
-            // Swap out the field headers leaving an empty Vec in place.
-            let tmp: Vec<FieldHeader> = Vec::new();
-            mem::swap(&mut tmp, &mut self.field_headers);            
+            }       
             
-            self.pending_records.push(Record { fields: fields, headers: tmp });
+            self.pending_records.push(Record { fields: fields });
         }
         
         // Handle a login failure.
@@ -600,7 +601,7 @@ impl MySQLConnection {
                     //self.pending_cmds_sent = 0;
                     self.tick_pending_cmd_queue();
                 },
-                TcpSocketMessage::Disconnected => {
+                TcpSocketMessage::Disconnected { reason } => {
                     self.connstate = ConnectionState::Connecting;
                     // Attempt to re-connect to the remote server.
                     self.socket.connect(self.remote_ip, self.remote_port);
