@@ -28,6 +28,8 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::io::Read;
 use core::str::StrExt;
+use std::thread;
+use std::time::Duration;
 
 fn create_net_instance() -> Net { 
     let toml = get_test_config();
@@ -193,16 +195,30 @@ fn main() {
     // transmissions. It may be improved to support meta-data along
     // with the transmissions in order to support more types of data
     // and information.
-    let rtrans: Arc<Mutex<Vec<Vec<f32>>>> = Arc::new(Mutex::new(Vec::new()));    
+    let rtrans: Arc<Mutex<Vec<ham::Transmission>>> = Arc::new(Mutex::new(Vec::new()));    
     let rtrans_cloned = rtrans.clone();
+    
+    let mut monitor: Vec<ham::MonitorSpec> = Vec::new();
+    
+    monitor.push(ham::MonitorSpec {
+        freq:       146420000.0,
+    });
+    
+    monitor.push(ham::MonitorSpec {
+        freq:       146440000.0,
+    });
+    
+    monitor.push(ham::MonitorSpec {
+        freq:       146480000.0,
+    });
     
     // The radio receiver runs as a separate thread at the cost of efficiency
     // in order to isolate it from a suspended wait by this thread due to the
     // processing of network events. It may be determined later that both of
     // these can be combined into a asynchronous single thread solution.
-    //thread::spawn(move || {
-    //    ham::router(rtrans_cloned);        
-    //});
+    thread::spawn(move || {
+        ham::router(rtrans_cloned, monitor);        
+    });
     
     // Here we handle getting the radio transmissions. They are then store them into
     // the MySQL data using our custom embedded ready network stack. These can then
@@ -242,39 +258,45 @@ fn main() {
     println!("created mysql connection instance");
     
     {
-        let mut rtrans_lock = rtrans.lock().unwrap();
-        let mut test: Vec<f32> = Vec::new();
-        for x in 0..4000 {
-            test.push(x as f32);
-        }
-        rtrans_lock.push(test);
+        //let mut rtrans_lock = rtrans.lock().unwrap();
+        //let mut test: Vec<f32> = Vec::new();
+        //for x in 0..4000 {
+        //    test.push(x as f32);
+        //}
+        //rtrans_lock.push(test);
     }
 
     loop {
         // Check if there are any transmissions and then grab one
         // of them.
-        let mut onetrans: Option<Vec<f32>> = Option::None;        
+        let mut onetrans: Option<ham::Transmission> = Option::None;        
         {
+            println!("trying to lock transmission queue");
             let mut rtrans_lock = rtrans.lock().unwrap();
             
             if rtrans_lock.len() > 0 {
+                println!("grabbed transmission from queue");
                 onetrans = Option::Some(rtrans_lock.remove(0));
+            } else {
+                println!("transmission queue is empty");
             }
         }                
 
         // Let the MySQL connection do any work that needs to be
         // done internally, but _do not_ block here.
+        println!("mysql ticking");
         mysqlconn.tick(false);
-
+        
+        println!("checking for transmissions fetched");
         // Do we have any transmissions to upload?
         match onetrans {
             Option::Some(v) => {
                 // INSERT INTO trans (freq, when, type, data) VALUES
-                let mut sqlbuf: Vec<u8> = Vec::with_capacity(v.len() + 1024);
+                let mut sqlbuf: Vec<u8> = Vec::with_capacity(v.buf.len() + 1024);
 
                 let xstart = format!(
-                    "INSERT INTO trans (freq, type, data) VALUES ({}, 'fmwb', X'",
-                    0
+                    "INSERT INTO trans (freq, type, dt, data) VALUES ({}, 'fmwb', NOW(), X'",
+                    v.freq
                 );
                 
                 let start = xstart.as_bytes();
@@ -284,8 +306,8 @@ fn main() {
                 }
                 
                 unsafe {
-                    let sz = v.len();
-                    let ptr = v.as_ptr();
+                    let sz = v.buf.len();
+                    let ptr = v.buf.as_ptr();
                     let u8buf = Vec::from_raw_parts(ptr as *mut u8, sz * std::mem::size_of::<f32>(), sz * std::mem::size_of::<f32>()); 
                     
                     // From my experiments I see that the MySQL
@@ -320,7 +342,9 @@ fn main() {
                 mysqlconn.query(usedb);
                 mysqlconn.query(sqlbuf);
             },
-            Option::None => (),
+            Option::None => {
+                thread::sleep(Duration::from_millis(2000));
+            },
         }   
         
         /*

@@ -60,6 +60,9 @@ pub struct TcpSocketSystem {
     net_tx:                 Sender<NetOp>,
     def_gw_mac6:            Vec<u8>,
     timeout_marker:         u64,
+    windowlimit:            usize,
+    outstanding:            usize,
+    windowdelay:            Vec<Vec<u8>>,    
 }
 
 pub enum DisconnectReason {
@@ -294,6 +297,9 @@ impl TcpSocketSystem {
             outholding:     Vec::new(),
             def_gw_mac6:    def_gw_mac6.clone(),
             timeout_marker: precise_time_ns(),
+            windowlimit:    4096,
+            outstanding:    0,
+            windowdelay:    Vec::new(),
         }
     }
 
@@ -393,12 +399,25 @@ impl TcpSocketSystem {
     ///   * does _NOT_ fully check validity of the packet
     ///   * shall construct acknowledgement packets
     ///   * shall maintain TCP socket state
-    pub fn onpacket(&mut self, pkt: EthIp4TcpPacket) {
-     if pkt.read_tcp_flags() & 0x10 != 0 {
-         self.txstate = TcpChannelState::Connected;
-         self.tx.send(TcpSocketMessage::Connected);
+    pub fn onpacket(&mut self, pkt: EthIp4TcpPacket, timerefns: u64) {
+     if pkt.read_tcp_flags() & 0x10 != 0  {
+         // Only interpret it as a connection success if we
+         // we trying to connect. At any other time it may
+         // be a normal acknowledgement, or perhaps we have
+         // disconnected.
+         match self.txstate {
+             TcpChannelState::Connecting => {
+                self.txstate = TcpChannelState::Connected;
+                self.tx.send(TcpSocketMessage::Connected);
+             },
+             _ => (),
+         }
      }
 
+     // This is the remote end trying to establish their
+     // TX channel, therefore, we will interpret this as
+     // a connection on the RX channel and set the RX state
+     // accordingly.
      if pkt.read_tcp_flags() & 0x02 != 0 {
          self.rxstate = TcpChannelState::Connected;
          /*
@@ -450,25 +469,39 @@ impl TcpSocketSystem {
 
          {
              let item = &self.outholding[x];
+             //println!("checking ack {} for packet {} removing it from limbo", rack, item.seq);
              if rack > item.seq {
-                 println!("got ack {} for packet {} removing it from limbo", rack, item.seq);
+                 //println!("GOOD ACK");
                  remit = true;
              }
          }
          
          if remit {
+             // Decrement our outstanding bytes by the amount acknowledged.
+             self.outstanding -= self.outholding[x].buf.len();
+             //println!("decremented outstanding to {} by {}", self.outstanding, self.outholding[x].buf.len());
              self.outholding.remove(x);
              hsz -= 1;
          } else {
              x = x + 1;
          }
-     }
+     }   
      
-     match remndx {
-         Option::None => (),
-         Option::Some(ndx) => { self.outholding.remove(ndx); },
-     }
-     
+     // See if we can push out some data held by our window limit.
+     //println!("[tcp] thinking about sending outstanding data count:{}", self.windowdelay.len());
+     while self.windowdelay.len() > 0 {            
+        if self.outstanding != 0 && self.outstanding + self.windowdelay[0].len() > self.windowlimit {
+            //println!("[tcp] aborting sending outstanding data; outstanding:{}", self.outstanding);
+            break;
+        }
+        
+        //println!("[tcp] sending outstanding data");
+        
+        let buf = self.windowdelay.remove(0);
+        self.send_data_nowindowcheck(buf, timerefns);
+        //println!("[tcp] outstanding is now count of {}", self.windowdelay.len());
+     }     
+          
      // This is _very_ important. At times there can be extra data after the end of the
      // IP payload. If we use the actual packet size read then we will consider data at
      // the end of the packet part of the TCP/IP payload which is not actual payload.
@@ -501,7 +534,7 @@ impl TcpSocketSystem {
          return;
      }
 
-     self.ack += payload.len() as u32;
+     self.ack += payload.len() as u32;  
 
      self.tx.send(TcpSocketMessage::Data(payload));
 
@@ -526,7 +559,7 @@ impl TcpSocketSystem {
              self.tx.send(TcpSocketMessage::Data(tmp.buf));
          }
      }
-
+     
      // Let the remote end know that we have the sequence up to this point
      // and we do not require any resends.
      let curack = self.ack;
@@ -652,16 +685,26 @@ impl TcpSocketSystem {
         // a specified amount of time has passed.
         let mut nbuf: Vec<u8> = Vec::with_capacity(data.len());
         nbuf.push_all(data);        
+
+        if self.outstanding + data.len() > self.windowlimit {
+            self.windowdelay.push(nbuf);
+            return;
+        }
+        
+        self.send_data_nowindowcheck(nbuf, timerefns);
+    }
+    
+    fn send_data_nowindowcheck(&mut self, nbuf: Vec<u8>, timerefns: u64) {                
+        let dataseq = self.seq;
+        self.seq += nbuf.len() as u32;
+        self.outstanding += nbuf.len();        
+        self.send_data_ex(nbuf.as_slice(), dataseq);
+        
         self.outholding.push(HeldOutPacket {
-            seq:        self.seq,
+            seq:        dataseq,
             buf:        nbuf,
             timerefns:  timerefns,
-        });
-        
-        println!("added packet to outgoing limbo with seq {}", self.seq);
-        let dataseq = self.seq;
-        self.seq += data.len() as u32;        
-        self.send_data_ex(data, dataseq);
+        });        
     }
         
     /// Send a packet containing data with the specified sequence number.
@@ -716,9 +759,9 @@ impl TcpSocketSystem {
         pkt.compute_ip_checksum();
         pkt.compute_tcp_checksum();
 
-        println!("socket sequence is {} and data.len is {}", self.seq, data.len());
+        //println!("socket sequence is {} and data.len is {}", self.seq, data.len());
         
-        println!("socket sequence is now {}", self.seq);
+        //println!("socket sequence is now {}", self.seq);
 
         //println!("socket sending data!!!");
         

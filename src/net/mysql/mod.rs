@@ -270,14 +270,14 @@ impl MySQLConnection {
                 // The pending response was an error.
                 self.responses.push(Response::Error);
                 self.pending_cmds.remove(0);
-                //self.pending_cmds_sent -= 1;
+                self.pending_cmds_sent -= 1;
                 return;
             } 
             
             if pktnum == 1 && pktsv.readu8(0) == 0 {
                 self.responses.push(Response::Success);
                 self.pending_cmds.remove(0);
-                //self.pending_cmds_sent -= 1;
+                self.pending_cmds_sent -= 1;
                 return;
             }
             
@@ -357,15 +357,17 @@ impl MySQLConnection {
                 return;
             }
             
-            if pktnum == 2 + self.number_of_fields {
-                // Should be an EOF marker.
-                if pktsv.readu8(0) != 0xfe && pktsv.readu8(0) != 0x00 {
-                    panic!("[mysql] expected EOF marker 0xfe or 0x00 but got {}", pktsv.readu8(0));
-                }
-                return                
-            }
+            //if pktnum == 2 + self.number_of_fields {
+            //    // Should be an EOF marker.
+            //    if pktsv.readu8(0) != 0x00 {
+            //    }
+            //    if pktsv.readu8(0) != 0xfe {
+            //        panic!("[mysql] expected EOF marker 0xfe or 0x00 but got {}", pktsv.readu8(0));
+            //    }
+            //    return                
+            //}
             
-            if pktsv.readu8(0) == 0xfe {
+            if pktsv.readu8(0) == 0xfe || (pktnum == 2 + self.number_of_fields && pktsv.readu8(0) == 0x00) {
                 // We should have received the last record, therefore,
                 // let us push these records as a response for the user
                 // code to fetch, and clear out state machine.
@@ -379,7 +381,10 @@ impl MySQLConnection {
                 self.responses.push(Response::Table { records: empty_records_vec, headers: tmp });
                 self.number_of_fields = 0;
                 self.pending_cmds.remove(0);
-                //self.pending_cmds_sent -= 1;
+
+                println!("MYSQL RECEIVED RESPONSE");                
+                
+                self.pending_cmds_sent -= 1;
                 return;
             }
             
@@ -543,6 +548,7 @@ impl MySQLConnection {
         let mut tmp: Vec<PendingCommand> = Vec::new();
         
         if !self.connstate.is_ready() {
+            println!("[mysql] connection state is not ready");
             // We can not send queries until the connection
             // is actually ready.
             return;
@@ -596,7 +602,7 @@ impl MySQLConnection {
             ConnectionState::Idle => {
                 println!("connection state is idle");   
                 if !self.socket.is_connected() {
-                    println!("[mysql] connecting");
+                    //println!("[mysql] connecting");
                     self.connstate = ConnectionState::Connecting;
                     self.socket.connect(self.remote_ip, self.remote_port);
                 }                             
@@ -606,7 +612,7 @@ impl MySQLConnection {
             ConnectionState::Ready => (),
         }
         
-        println!("[mysql] we must be connected or not idle");
+        //println!("[mysql] we must be connected or not idle");
         // If there are any commands which have not been sent, then
         // we shall handle that now.
         self.tick_pending_cmd_queue();
@@ -619,14 +625,16 @@ impl MySQLConnection {
                     return;
                 },
                 TcpSocketMessage::Connected => {
+                    println!("TCP connection is connected for MYSQL");
                     self.connstate = ConnectionState::Connected;
                     // If there are still pending commands then let us
                     // re-issue those commands.
                     //self.pending_cmds_sent = 0;
-                    println!("socket says we are connected");
+                    //println!("socket says we are connected");
                     self.tick_pending_cmd_queue();
                 },
                 TcpSocketMessage::Disconnected { reason } => {
+                    panic!("TCP connection was disconnected for MYSQL");
                     self.connstate = ConnectionState::Connecting;
                     // Attempt to re-connect to the remote server.
                     self.socket.connect(self.remote_ip, self.remote_port);
@@ -642,8 +650,12 @@ impl MySQLConnection {
                     //self.socket.connect(self.remote_ip, self.remote_port);
                 },
                 TcpSocketMessage::EndOfStream => {
-                    // Do nothing.
-                    // TODO: revise logic here
+                    // If we are not supposed to block then exit
+                    // this loop and return since there was no
+                    // messages on the socket.
+                    if !netblock {
+                        break;
+                    }
                 }, 
             }
         }
