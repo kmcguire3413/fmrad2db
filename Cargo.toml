@@ -1,12 +1,12 @@
 [package]
 name = "fmrad2db"
-version = "0.1.0"
-authors = ["kmcguire"]
+version = "0.2.64"
+authors = ["kmcg3413@gmail.com"]
 
 [dependencies.pcap]
 [dependencies.byteorder]
 [dependencies.toml]
 [dependencies.ham]
-git = "https://github.com/kmcguire3413/ham-rs"
+path  = "/home/kmcguire/Projects/ham-rs/"
 [dependencies.rand]
 [dependencies.time]

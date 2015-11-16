@@ -234,6 +234,7 @@ fn worker_net(
         net_tx: Sender<NetOp>, rx: Receiver<NetOp>, tx: Sender<NetOp>,
         def_gw_mac6: Vec<u8>
     ) {
+    // TODO: need to check this and give useful output to diagnose the problem
 	let mut cap = Box::new(Device::lookup().unwrap().open().unwrap());
 
 	let mut tcpsockets: Vec<TcpSocketSystem>;
@@ -360,7 +361,7 @@ fn worker_net(
 							/*
 								Service the socket.
 							*/
-							tcpsocket.onnotify();
+							tcpsocket.onnotify(curtime);
 							break;
 						}
 					}

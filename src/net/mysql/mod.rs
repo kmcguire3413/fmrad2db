@@ -141,6 +141,12 @@ impl ConnectionState {
             _ => false,
         }
     }
+    pub fn is_ready(&self) -> bool {
+        match self {
+            &ConnectionState::Ready => true,
+            _ => false,
+        }
+    }
 }
 
 pub enum SocketReadError {
@@ -353,8 +359,8 @@ impl MySQLConnection {
             
             if pktnum == 2 + self.number_of_fields {
                 // Should be an EOF marker.
-                if pktsv.readu8(0) != 0xfe {
-                    panic!("[mysql] expected EOF marker 0xfe");
+                if pktsv.readu8(0) != 0xfe && pktsv.readu8(0) != 0x00 {
+                    panic!("[mysql] expected EOF marker 0xfe or 0x00 but got {}", pktsv.readu8(0));
                 }
                 return                
             }
@@ -535,6 +541,14 @@ impl MySQLConnection {
     
     fn tick_pending_cmd_queue(&mut self) {
         let mut tmp: Vec<PendingCommand> = Vec::new();
+        
+        if !self.connstate.is_ready() {
+            // We can not send queries until the connection
+            // is actually ready.
+            return;
+        }
+
+        // Make sure that we are connected.
 
         mem::swap(&mut tmp, &mut self.pending_cmds);
                 
@@ -578,11 +592,21 @@ impl MySQLConnection {
     ///   * network traffic may happen on system side of socket between calls
     pub fn tick(&mut self, netblock: bool) {
         // https://github.com/kmcguire3413/fmrad2db/issues/8
-        if self.connstate.is_idle() && !self.socket.is_connected() {
-            self.socket.connect(self.remote_ip, self.remote_port);
-            self.connstate = ConnectionState::Connecting;
-            return;
+        match self.connstate {
+            ConnectionState::Idle => {
+                println!("connection state is idle");   
+                if !self.socket.is_connected() {
+                    println!("[mysql] connecting");
+                    self.connstate = ConnectionState::Connecting;
+                    self.socket.connect(self.remote_ip, self.remote_port);
+                }                             
+            },
+            ConnectionState::Connecting => (),
+            ConnectionState::Connected => (),
+            ConnectionState::Ready => (),
         }
+        
+        println!("[mysql] we must be connected or not idle");
         // If there are any commands which have not been sent, then
         // we shall handle that now.
         self.tick_pending_cmd_queue();
@@ -599,6 +623,7 @@ impl MySQLConnection {
                     // If there are still pending commands then let us
                     // re-issue those commands.
                     //self.pending_cmds_sent = 0;
+                    println!("socket says we are connected");
                     self.tick_pending_cmd_queue();
                 },
                 TcpSocketMessage::Disconnected { reason } => {
@@ -609,8 +634,12 @@ impl MySQLConnection {
                 TcpSocketMessage::Connect {dstip, dstport } => panic!("internal error"),
                 TcpSocketMessage::Disconnect => panic!("internal error"),
                 TcpSocketMessage::Error => {
-                    self.connstate = ConnectionState::Connecting;
-                    self.socket.connect(self.remote_ip, self.remote_port);
+                    // TODO: In this situation we may consider something alternative
+                    //       since I feel like the `TcpSocketMessage::Error` is going
+                    //       to be very abnormal of a condition to encounter and will
+                    //       represent something much like an internal error.
+                    //self.connstate = ConnectionState::Connecting;
+                    //self.socket.connect(self.remote_ip, self.remote_port);
                 },
                 TcpSocketMessage::EndOfStream => {
                     // Do nothing.

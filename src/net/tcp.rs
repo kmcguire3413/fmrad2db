@@ -11,6 +11,7 @@
 use std::sync::mpsc::{Sender, Receiver, channel, TryRecvError};
 use std::sync::atomic::{AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
 
+use std::mem::swap;
 use super::NetOp;
 use super::packets::EthIp4TcpPacket;
 use super::precise_time_ns;
@@ -22,11 +23,20 @@ pub enum TcpChannelState {
     Disconnected,
 }
 
-/// A packet that has not been acknowledged by the remote machine,
-/// and is held in limbo awaiting the possibility of retransmission.
+
+/// A packet that has been received from the remote machine not in the
+/// correct order, and it is awaiting the data that comes before it.
 pub struct TcpSocketHeldPacket {
     seq:                            u32,
     buf:                            Vec<u8>,
+}
+
+/// A packet that has not been acknowledged by the remote machine,
+/// and is held in limbo awaiting the possibility of retransmission. 
+pub struct HeldOutPacket {
+    seq:                            u32,
+    buf:                            Vec<u8>,
+    timerefns:                      u64,
 }
 
 /// The system side instance of the TCP socket.
@@ -43,6 +53,7 @@ pub struct TcpSocketSystem {
     seq:                    u32,
     mtu:                    usize,
     handle:                 usize,
+    outholding:             Vec<HeldOutPacket>,
     holding:                Vec<TcpSocketHeldPacket>,
     tx:                     Sender<TcpSocketMessage>,
     rx:                     Receiver<TcpSocketMessage>,
@@ -280,6 +291,7 @@ impl TcpSocketSystem {
             handle:         handle,
             mtu:            mtu,
             holding:        Vec::new(),
+            outholding:     Vec::new(),
             def_gw_mac6:    def_gw_mac6.clone(),
             timeout_marker: precise_time_ns(),
         }
@@ -328,22 +340,51 @@ impl TcpSocketSystem {
     ///   * owner of this socket shall call this periodically
     ///   * `timeref` shall be as accurate, _as possible_, in time units from last call
     pub fn periodic_work(&mut self, timerefns: u64) {
-        if timerefns - self.timeout_marker > 1000 * 1000 * 1000 * 60 {
-            // The connection has an inactive period that exceeds the
-            // specified limit, therefore, it shall be closed.
-            self.send_reset();
-            // Clear to prevent the remote end from exploiting any
-            // code paths that cause the connection to continue to function.
-            self.dst_ip = 0;
-            self.dst_port = 0;
-            // Set both channels to the disconnected state.
-            self.txstate = TcpChannelState::Disconnected;
-            self.rxstate = TcpChannelState::Disconnected;
-            // Alert the user side of the socket to this change
-            // in state of the socket and connection.
-            self.tx.send(TcpSocketMessage::Disconnected{ reason: DisconnectReason::Timeout });
+        // Check if enough time has elapsed that we need to re-transmit any packets
+        // that have not been acknowledged by the remote machine.
+        let mut outholding: Vec<HeldOutPacket> = Vec::new();
+        
+        swap(&mut outholding, &mut self.outholding);        
+        
+        for x in 0..outholding.len() {
+            let item = &mut outholding[x];
+            if timerefns - item.timerefns > 1000 * 1000 * 1000 * 10 {
+                // Send the data with the correct sequence number and
+                // update the time reference field.
+                item.timerefns = timerefns;
+                self.send_data_ex(item.buf.as_slice(), item.seq);
+            }
+        }        
+        
+        swap(&mut outholding, &mut self.outholding);
+        
+        // If the connection has been inactive for too long then we shall
+        // drop the connection.
+        if timerefns - self.timeout_marker > 1000 * 1000 * 1000 * 60 * 5 {
+            match self.rxstate { 
+                TcpChannelState::Connected => {
+                    self.reset(DisconnectReason::Timeout);
+                },
+                _ => (),
+            }
         }
     }    
+    
+    pub fn reset(&mut self, reason: DisconnectReason) {
+        // The connection has an inactive period that exceeds the
+        // specified limit, therefore, it shall be closed.
+        self.send_reset();
+        // Clear to prevent the remote end from exploiting any
+        // code paths that cause the connection to continue to function.
+        self.dst_ip = 0;
+        self.dst_port = 0;
+        // Set both channels to the disconnected state.
+        self.txstate = TcpChannelState::Disconnected;
+        self.rxstate = TcpChannelState::Disconnected;
+        // Alert the user side of the socket to this change
+        // in state of the socket and connection.
+        self.tx.send(TcpSocketMessage::Disconnected{ reason: reason });        
+    }
 
     /// Interprets a packet for data and control information.
     ///
@@ -387,57 +428,71 @@ impl TcpSocketSystem {
          self.tx.send(TcpSocketMessage::Disconnected { reason: DisconnectReason::Remote });
      }
 
-     /*
-         Is there any data attached? Let us read it into our incoming
-         buffer and also acknowledge the data.
-
-         seq
-         ack
-     */
+     // Is there any data attached? Let us read it into our incoming
+     // buffer and also acknowledge the data.
      
      self.timeout_marker = precise_time_ns();
+     
+     // Let us read the acknowledgement and see if we can remove some packets
+     // that are in outgoing limbo. We have to be aware that a single acknowledgement
+     // can acknowledge multiple packets at once, therefore, a loop exists which matches
+     // these and removes them.
+     let rack = pkt.read_tcp_acknowledge();  
+     let mut remndx: Option<usize> = Option::None;     
+     let mut hsz = self.outholding.len();     
+     
+     // TODO: consider optimization of `outholding` to support efficient removal
+     //       since at the moment this involves a substantial performance hit since
+     //       all elements are shifted for each removal
+     let mut x = 0;
+     while x < hsz {
+         let mut remit = false;
 
-
-     let data_offset = pkt.read_tcp_offset() + pkt.read_tcp_hdrlen() as usize * 4;
-
-     //println!("tcp_offset:{} data_offset:{} hdrlen:{} pkt.len():{}",
-     //    pkt.read_tcp_offset(),
-     //    data_offset,
-     //    pkt.read_tcp_hdrlen() * 4,
-     //    pkt.len()
-     //);
-
-     if data_offset >= pkt.len() {
-         return;
+         {
+             let item = &self.outholding[x];
+             if rack > item.seq {
+                 println!("got ack {} for packet {} removing it from limbo", rack, item.seq);
+                 remit = true;
+             }
+         }
+         
+         if remit {
+             self.outholding.remove(x);
+             hsz -= 1;
+         } else {
+             x = x + 1;
+         }
      }
      
-     /*
-        This is _very_ important. At times there can be extra data after the end of the
-        IP payload. If we use the actual packet size read then we will consider data at
-        the end of the packet part of the TCP/IP payload which is not actual payload.
-        
-        The source of these extra bytes are unknown. They could be from the system that
-        hands us the packets, the network card, or from the actual remote system.
-     */
+     match remndx {
+         Option::None => (),
+         Option::Some(ndx) => { self.outholding.remove(ndx); },
+     }
+     
+     // This is _very_ important. At times there can be extra data after the end of the
+     // IP payload. If we use the actual packet size read then we will consider data at
+     // the end of the packet part of the TCP/IP payload which is not actual payload.
+     // 
+     // The source of these extra bytes are unknown. They could be from the system that
+     // hands us the packets, the network card, or from the actual remote system.
+     
+     let data_offset = pkt.read_tcp_offset() + pkt.read_tcp_hdrlen() as usize * 4;
      let last_ip_payload_byte = pkt.read_ip_total_length() as usize + pkt.read_ip_offset() as usize;
+
+     if last_ip_payload_byte - data_offset <= 0 {
+         return;
+     }
 
      let payload = pkt.data.readu8i(data_offset, last_ip_payload_byte - data_offset);
 
-     //println!("PAYLOAD:{}", payload.len());
-
-     /*
-         If this does not match out expected acknowledgement value,
-         then let us store it away, and wait for the missing piece.
-     */
+     // If this does not match out expected acknowledgement value,
+     // then let us store it away, and wait for the missing piece.
+     
      if pkt.read_tcp_sequence() != self.ack {
-         //println!("packet out of order; delaying pkt.seq{} self.ack:{}", pkt.read_tcp_sequence(), self.ack);
-         /*
-             Go ahead and let the remote end know that we received this packet.
-
-             TODO: Is this correct? Should I instead only acknowledge the packets
-                   in the correct order.
-         */
-         self.send_ack(pkt.read_tcp_sequence() + payload.len() as u32);
+         // This packet arrived out of order. We do not acknowledge it since our acknowledgement
+         // would tell the remote end that we have received in order everything below this sequence
+         // number. We shall only acknowledge packets in the correct order.
+         // self.send_ack(pkt.read_tcp_sequence() + payload.len() as u32);
 
          self.holding.push(TcpSocketHeldPacket {
              seq:    pkt.read_tcp_sequence(),
@@ -448,23 +503,11 @@ impl TcpSocketSystem {
 
      self.ack += payload.len() as u32;
 
-     //println!("@@@ [tcp-socket] sent TX message with payload");
      self.tx.send(TcpSocketMessage::Data(payload));
 
-     /*
-         Acknowledge the data.
-
-         OPTIMIZE: We could tag on a payload if we have data that needs to
-                   be sent out.
-     */
-     let cur_ack = self.ack;
-     self.send_ack(cur_ack);
-
-     /*
-         We know this was the next expected. Now run back through
-         any packets that were in holding/limbo and see if we can
-         push them through to the user code.
-     */
+     // We know this was the next expected. Now run back through
+     // any packets that were in holding/limbo and see if we can
+     // push them through to the user code.
      let mut keep_going: i32 = 0;
      while keep_going > -1 {
          keep_going = -1;
@@ -478,24 +521,16 @@ impl TcpSocketSystem {
          }
          if keep_going > -1 {
              let tmp = self.holding.remove(keep_going as usize);
-             /*
-                 Advance our actual acknowledgement value.
-             */
+             // Advance our actual acknowledgement value.
              self.ack += tmp.buf.len() as u32;
-             /*
-                 These have already had an acknowledgement sent. So
-                 just push them through to the user code in the correct
-                 order and remove them from limbo.
-             */
              self.tx.send(TcpSocketMessage::Data(tmp.buf));
          }
      }
-     /*
-         At this point our acknowledgement should have been caught up as
-         much as possible. We may still be missing packets and therefore
-         there may still be packets in holding/limbo. The next packet will
-        start the process over.
-     */
+
+     // Let the remote end know that we have the sequence up to this point
+     // and we do not require any resends.
+     let curack = self.ack;
+     self.send_ack(curack);     
     }
     /// Intended to allow socket to process internal channels for commands
     /// and data that be waiting.
@@ -503,7 +538,11 @@ impl TcpSocketSystem {
     /// The data and commands are sent from the user side instance of the
     /// socket a channel. This function allows the network thread to allow
     /// _this socket_ to process that channel and any commands or data.
-    pub fn onnotify(&mut self) {
+    ///
+    /// # Contract
+    ///   * `timerefns` shall be in nanoseconds
+    ///   * caller shall attempt to only call when there are messages waiting to be read
+    pub fn onnotify(&mut self, timerefns: u64) {
         loop {
             let result = self.rx.try_recv();
             match result {
@@ -519,20 +558,34 @@ impl TcpSocketSystem {
                             let chunk_count = data.len() / self.mtu;
                             let chunk_slack = data.len() % self.mtu;
                             for chunk in data.chunks(self.mtu) {
-                                self.send_data(chunk);
+                                self.send_data(chunk, timerefns);
                             }
                         },
                         TcpSocketMessage::Connect {
                             dstip,
                             dstport
                         } => {
-                            self.dst_mac = self.def_gw_mac6.clone();
-                            self.dst_ip = dstip;
-                            self.dst_port = dstport;
-                            self.try_connect();
+                            if self.dst_ip == dstip && self.dst_port == dstport && 
+                               match self.txstate {
+                                   TcpChannelState::Connecting => true,
+                                   _ => false,
+                               } {
+                               // Just ignore this as it likely may be coming from
+                               // a misbehaving user side program. If they truly desire
+                               // to attempt connection again to the same remote machine
+                               // that we are currently connecting to then it would be
+                               // polite for us to get a disconnect and also for the 
+                               // remote machine.      
+                            } else {
+                                self.dst_mac = self.def_gw_mac6.clone();
+                                self.dst_ip = dstip;
+                                self.dst_port = dstport;
+                                self.timeout_marker = timerefns; 
+                                self.try_connect();
+                            }
                         },
                         TcpSocketMessage::Disconnect => {
-                            /* TODO: implement */
+                            self.reset(DisconnectReason::Local);
                         },
                         _ => (),
                     }
@@ -564,6 +617,26 @@ impl TcpSocketSystem {
     }
     
     pub fn send_reset(&mut self) {
+        let mut pkt = EthIp4TcpPacket::default();
+
+        pkt.write_eth_mac_src(&self.src_mac);
+        pkt.write_eth_mac_dst(&self.dst_mac);
+        pkt.write_ip_src(self.src_ip);
+        pkt.write_ip_dst(self.dst_ip);
+        pkt.write_tcp_port_src(self.src_port);
+        pkt.write_tcp_port_dst(self.dst_port);
+        // TODO: Should we also set FIN or just RST?
+        pkt.write_tcp_flags(0x05);
+        // TODO: Is this acknowledgement number correct? Does it matter?
+        pkt.write_tcp_acknowledge(self.ack);
+        pkt.write_tcp_sequence(self.seq);
+
+        pkt.compute_ip_checksum();
+        pkt.compute_tcp_checksum();
+
+        let mut data = pkt.get_data();
+
+        self.net_tx.send(NetOp::SendEth8023Packet(data));        
     }
     
     /// Send a packet containing data.
@@ -571,9 +644,36 @@ impl TcpSocketSystem {
     /// # Contract
     ///   * shall transmit data as soon as possible
     ///   * will not check if data exceeds network MTU
-    pub fn send_data(&mut self, data: &[u8]) {
+    ///   * shall update sequence number
+    ///   * will modify local state of connection
+    pub fn send_data(&mut self, data: &[u8], timerefns: u64) {
+        // We need to store what we send, because it might not reach
+        // the destination, therefore, we will need to resend it after
+        // a specified amount of time has passed.
+        let mut nbuf: Vec<u8> = Vec::with_capacity(data.len());
+        nbuf.push_all(data);        
+        self.outholding.push(HeldOutPacket {
+            seq:        self.seq,
+            buf:        nbuf,
+            timerefns:  timerefns,
+        });
+        
+        println!("added packet to outgoing limbo with seq {}", self.seq);
+        let dataseq = self.seq;
+        self.seq += data.len() as u32;        
+        self.send_data_ex(data, dataseq);
+    }
+        
+    /// Send a packet containing data with the specified sequence number.
+    ///
+    /// # Contract
+    ///   * shall transmit data as soon as possible
+    ///   * will not check if data exceeds network MTU
+    ///   * shall use sequence number provided 
+    ///   * _shall not_ modify local state of connection
+    fn send_data_ex(&mut self, data: &[u8], seq: u32) {
         let mut pkt = EthIp4TcpPacket::default();
-
+        
         pkt.write_eth_mac_src(&self.src_mac);
         pkt.write_eth_mac_dst(&self.dst_mac);
         pkt.write_ip_src(self.src_ip);
@@ -599,7 +699,10 @@ impl TcpSocketSystem {
             },
         }
 
-        pkt.write_tcp_sequence(self.seq);
+        // Use the sequence number as the argument provided
+        // to this function, since this function is used to
+        // resend data.
+        pkt.write_tcp_sequence(seq);
 
         let tcp_offset = pkt.read_tcp_offset();
         let tcp_hdrlen = pkt.read_tcp_hdrlen();
@@ -614,8 +717,6 @@ impl TcpSocketSystem {
         pkt.compute_tcp_checksum();
 
         println!("socket sequence is {} and data.len is {}", self.seq, data.len());
-
-        self.seq += data.len() as u32;
         
         println!("socket sequence is now {}", self.seq);
 
@@ -647,6 +748,7 @@ impl TcpSocketSystem {
         pkt.compute_tcp_checksum();
 
         self.txstate = TcpChannelState::Connecting;
+        self.rxstate = TcpChannelState::Connecting;
 
         let mut data = pkt.get_data();
 
